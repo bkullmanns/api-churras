@@ -4,8 +4,11 @@ const cors = require("cors");
 const app = express();
 const bodyParser = require("body-parser");
 const { Model, raw } = require("objection");
-const { Dog } = require("./models/Dog");
+const { User } = require("./models/User");
+const { BBQ } = require("./models/BBQ");
 const knexConfig = require("./knexfile");
+const jwt = require("jsonwebtoken");
+const bcrypt = require("bcrypt");
 
 app.use(cors());
 app.use(bodyParser.json());
@@ -14,99 +17,141 @@ const knex = require("knex")(knexConfig);
 
 Model.knex(knex);
 
-app.get("/dogs", async (req, res) => {
-  try {
-    const dogs = await Dog.query();
+const generateToken = (id) => {
+  return jwt.sign({ id }, process.env.JWT_SECRET);
+};
 
-    if (dogs) {
-      return res.json(dogs);
-    }
+const verifyToken = async (token, opts) => {
+  return await jwt.verify(token, process.env.JWT_SECRET, opts);
+};
 
-    throw Error("There are no dogs");
-  } catch (error) {
-    res.json({ error: error.message });
+const checkForToken = async (req) => {
+  if (!req.headers.hasOwnProperty("authorization")) {
+    return { error: "No authorization header found" };
   }
+
+  const auth = req.headers.authorization.split(" ");
+  if (auth[0] == "Bearer" && auth[1]) {
+    try {
+      const token = await verifyToken(auth[1]);
+      return { error: null, token };
+    } catch (error) {
+      return { error: error.message };
+    }
+  }
+
+  return { error: "No token found" };
+};
+
+app.post("/login", async (req, res) => {
+  try {
+    const user = await User.query().findOne({ email: req.body.email });
+
+    if (!user) return res.json({ error: "Invalid credentials" });
+
+    if (bcrypt.compareSync(req.body.password, user.password)) {
+      return res.json({
+        token: generateToken(user.id),
+        name: user.name,
+        id: user.id,
+      });
+    }
+  } catch (error) {
+    return { error: error.message };
+  }
+
+  return res.json({ error: "Invalid credentials" });
 });
 
-app.post("/dogs", async (req, res) => {
-  console.log("data", req.body);
+app.get("/bbqs", async (req, res) => {
+  const auth = await checkForToken(req);
+
+  if (auth.error) {
+    return res.json({ error: auth.error });
+  }
+
   try {
-    const dog = await Dog.query().insert({
-      name: req.body.name,
-      breed: req.body.breed,
-      img: req.body.img,
-      genre: req.body.genre,
-      bio: req.body.bio,
-    });
-    if (dog) {
-      return res.json(dog);
+    const bbqs = await User.relatedQuery("bbqs")
+      .for(auth.token.id)
+      .withGraphFetched("guests");
+    if (bbqs) {
+      return res.json({ bbqs });
     }
-    throw Error("Error while trying to insert a new dog");
+
+    return res.json({ error: "User not found" });
   } catch (error) {
     return res.json({ error: error.message });
   }
 });
 
-app.get("/dogs/breeds", async (req, res) => {
+app.post("/bbqs", async (req, res) => {
+  const auth = await checkForToken(req);
+
+  if (auth.error) {
+    return res.json({ error: auth.error });
+  }
+
   try {
-    const dogs = await knex.raw(
-      "WITH cte as (select *, ROW_NUMBER() OVER (PARTITION BY breed ORDER BY id desc) row_numer from dogs) select * from cte where row_numer < 3"
+    const bbq = await User.relatedQuery("bbqs").for(auth.token.id).insert({
+      name: req.body.name,
+      date: req.body.date,
+      suggested_value: req.body.suggested_value,
+      suggested_value_without_beverage:
+        req.body.suggested_value_without_beverage,
+    });
+    if (bbq) {
+      return res.json({ bbq });
+    }
+
+    return res.json({ error: "User not found" });
+  } catch (error) {
+    return res.json({ error: error.message });
+  }
+});
+
+app.patch("/bbqs/:id", async (req, res) => {
+  const auth = await checkForToken(req);
+
+  if (auth.error) {
+    return res.json({ error: auth.error });
+  }
+
+  try {
+    const bbq = await BBQ.query().upsertGraph(
+      { id: req.params.id, ...req.body },
+      { relate: ["guests"] }
     );
 
-    if (dogs) {
-      return res.json(dogs.rows);
+    if (bbq) {
+      return res.json({ bbq });
     }
 
-    throw Error("There are no dogs");
+    return res.json({ error: "BBQ not found" });
   } catch (error) {
-    res.json({ error: error.message });
+    return res.json({ error: error.message });
   }
 });
 
-app.get("/dogs/:breed", async (req, res) => {
-  try {
-    const breed = req.params.breed;
-    const dogs = await Dog.query().where("breed", breed);
+app.delete("/bbqs/:id", async (req, res) => {
+  const auth = await checkForToken(req);
 
-    if (dogs) {
-      return res.json(dogs);
-    }
-
-    throw Error(`There are no dogs of breed "${breed}"`);
-  } catch (error) {
-    res.json({ error: error.message });
+  if (auth.error) {
+    return res.json({ error: auth.error });
   }
-});
 
-app.get("/dogs/:breed/:id", async (req, res) => {
   try {
-    const id = req.params.id;
-    const dog = await Dog.query().findById(id);
-
-    if (dog) {
-      return res.json(dog);
-    }
-
-    throw Error(`Dog with id "${id}" does not exist`);
-  } catch (error) {
-    res.json({ error: error.message });
-  }
-});
-
-app.patch("/dogs/:breed/:id/gooddog", async (req, res) => {
-  try {
-    const id = req.params.id;
-    const dog = await Dog.query().patchAndFetchById(id, {
-      good_dog: raw("good_dog + 1"),
+    const deleted = await BBQ.query().delete().where({
+      id: req.params.id,
+      organizer_id: auth.token.id,
     });
 
-    if (dog) {
-      return res.json(dog);
+    if (deleted) {
+      return res.json({ bbq: { id: req.params.id } });
     }
 
-    throw Error(`Dog with id "${id}" does not exist`);
+    return res.json({ error: "BBQ not deleted" });
   } catch (error) {
-    res.json({ error: error.message });
+    return res.json({ error: error.message });
   }
 });
 
